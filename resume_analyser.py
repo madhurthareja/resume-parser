@@ -5,6 +5,7 @@ from typing import List, Optional, Union
 import json
 import os
 from pypdf import PdfReader
+import pandas as pd
 
 # Define Pydantic models
 class ResumeData(BaseModel):
@@ -35,9 +36,19 @@ class AnalysisData(BaseModel):
     suitability_score: int
     summary: str
 
+# Define model for bulk resume extraction
+class BulkResumeData(BaseModel):
+    name: str
+    email: str
+    college: Optional[str]
+    highest_education: Optional[str]
+    research_interests: Optional[Union[str, List[str], List[dict]]]
+    prior_work: Optional[Union[str, List[str], List[dict]]]
+    publications_or_projects: Optional[Union[str, List[str], List[dict]]]
+
 # Initialize Streamlit app
 st.title("Resume-Job Match Analyzer")
-st.markdown("Upload a resume PDF and enter a job description to get a brutally honest analysis of the candidate’s fit.")
+st.markdown("Upload a resume PDF and enter a job description to get a realistic, evidence-based analysis of fit.")
 
 # Set up Groq client
 api_key = st.secrets.get("GROQ_API_KEY", None) or os.getenv("GROQ_API_KEY")
@@ -54,11 +65,8 @@ MODEL_NAME = "llama-3.1-8b-instant"
 #     if api_key:
 #         client = genai.Client(api_key=api_key)
 
-# File uploader for resume PDF
-resume_file = st.file_uploader("Upload Resume PDF", type=["pdf"])
-
-# Text area for job description
-job_description = st.text_area("Enter Job Description", placeholder="e.g., Senior Software Engineer requiring Python, React, AWS, Bachelor's in CS, 3+ years experience")
+# Tabs
+tab_match, tab_bulk = st.tabs(["Match Analyzer", "Bulk Extractor"])
 
 # Session state for storing JSONs, messages, and analysis
 if "resume_json" not in st.session_state:
@@ -118,6 +126,67 @@ def process_resume(file):
     except (ValidationError, json.JSONDecodeError) as e:
         st.error(f"Failed to parse resume JSON: {e}")
         return None, None
+
+def _list_or_str_to_text(value: Optional[Union[str, List[str], List[dict]]]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        normalized_items = []
+        for item in value:
+            if isinstance(item, dict):
+                normalized_items.append(json.dumps(item, ensure_ascii=True))
+            else:
+                normalized_items.append(str(item))
+        return ", ".join([item for item in normalized_items if item.strip()])
+    return str(value)
+
+def process_resume_bulk(file):
+    try:
+        file.seek(0)
+        reader = PdfReader(file)
+        pages_text = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            pages_text.append(page_text)
+        resume_text = "\n".join(pages_text).strip()
+
+        if not resume_text:
+            return None, "Could not extract text from the PDF."
+
+        prompt = (
+            "Extract the details from the resume text. "
+            "Include the following fields: name, email, college, highest_education, research_interests, prior_work, publications_or_projects. "
+            "Return only valid JSON with those fields. Use empty strings for missing fields. "
+            "Use lists for research_interests, prior_work, and publications_or_projects when needed. "
+            "For prior_work or publications_or_projects, you may return lists of objects with keys like title, organization, role, and duration.\n\n"
+            f"Resume Text:\n{resume_text}"
+        )
+
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You extract structured data and output strict JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+
+        raw_json = response.choices[0].message.content
+        resume_data = BulkResumeData.model_validate_json(raw_json)
+
+        return {
+            "Name": resume_data.name,
+            "Email": resume_data.email,
+            "College": resume_data.college or "",
+            "Highest Education": resume_data.highest_education or "",
+            "Research Interests": _list_or_str_to_text(resume_data.research_interests),
+            "Experience/Prior Work": _list_or_str_to_text(resume_data.prior_work),
+            "Publications or Key Projects": _list_or_str_to_text(resume_data.publications_or_projects),
+        }, None
+
+    except (ValidationError, json.JSONDecodeError) as e:
+        return None, f"Failed to parse resume JSON: {e}"
 
 # Function to process job description
 def process_job_description(text):
@@ -232,90 +301,136 @@ def answer_question(question, resume, job, analysis):
         st.error(f"Error answering question: {e}")
         return "Failed to answer the question due to an error."
 
-# Process button
-if st.button("Analyze Match"):
-    if resume_file and job_description:
-        with st.spinner("Processing resume..."):
-            resume_data, resume_raw = process_resume(resume_file)
-            if resume_data:
-                st.session_state.resume_json = resume_data.model_dump()
-        
-        with st.spinner("Processing job description..."):
-            job_data, job_raw = process_job_description(job_description)
-            if job_data:
-                st.session_state.job_json = job_data.model_dump()
-        
-        if st.session_state.resume_json and st.session_state.job_json:
-            # JSONs are processed but not displayed
-            pass
+with tab_match:
+    # File uploader for resume PDF
+    resume_file = st.file_uploader("Upload Resume PDF", type=["pdf"])
+
+    # Text area for job description
+    job_description = st.text_area("Enter Job Description", placeholder="e.g., Senior Software Engineer requiring Python, React, AWS, Bachelor's in CS, 3+ years experience")
+
+    # Process button
+    if st.button("Analyze Match"):
+        if resume_file and job_description:
+            with st.spinner("Processing resume..."):
+                resume_data, resume_raw = process_resume(resume_file)
+                if resume_data:
+                    st.session_state.resume_json = resume_data.model_dump()
             
-            # Analyze match
-            with st.spinner("Analyzing match..."):
-                analysis = analyze_match(
-                    ResumeData(**st.session_state.resume_json),
-                    JobData(**st.session_state.job_json)
-                )
-                st.session_state.last_analysis = analysis
+            with st.spinner("Processing job description..."):
+                job_data, job_raw = process_job_description(job_description)
+                if job_data:
+                    st.session_state.job_json = job_data.model_dump()
+            
+            if st.session_state.resume_json and st.session_state.job_json:
+                # JSONs are processed but not displayed
+                pass
+                
+                # Analyze match
+                with st.spinner("Analyzing match..."):
+                    analysis = analyze_match(
+                        ResumeData(**st.session_state.resume_json),
+                        JobData(**st.session_state.job_json)
+                    )
+                    st.session_state.last_analysis = analysis
 
-            # Display dashboard
-            if analysis:
-                st.subheader("Match Analysis Dashboard")
-                
-                # Layout with columns
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    # Skills Match Table
-                    st.markdown("**Skills Match**")
-                    skills_data = {
-                        "Matched Skills": ", ".join(analysis.skills_match.matched) or "None",
-                        "Missing Skills": ", ".join(analysis.skills_match.missing) or "None",
-                        "Match Percentage": f"{analysis.skills_match.percentage:.1f}%"
-                    }
-                    st.dataframe(skills_data, use_container_width=True)
+                # Display dashboard
+                if analysis:
+                    st.subheader("Match Analysis Dashboard")
                     
-                    # Education and Experience Fit
-                    st.markdown("**Education Fit**")
-                    st.write(analysis.education_fit)
-                    st.markdown("**Experience Fit**")
-                    st.write(analysis.experience_fit)
-                
-                with col2:
-                    # Suitability Score
-                    st.markdown("**Suitability Score**")
-                    st.metric(label="Score (0-100)", value=analysis.suitability_score)
-                
-                # Summary
-                st.markdown("**Summary**")
-                st.write(analysis.summary)
-                
-                # Add to messages for chat history
-                st.session_state.messages.append({
-                    "role": "system",
-                    "content": f"Analysis completed: Suitability Score {analysis.suitability_score}/100"
-                })
-    else:
-        st.error("Please upload a resume PDF and enter a job description.")
+                    # Layout with columns
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        # Skills Match Table
+                        st.markdown("**Skills Match**")
+                        skills_data = {
+                            "Matched Skills": ", ".join(analysis.skills_match.matched) or "None",
+                            "Missing Skills": ", ".join(analysis.skills_match.missing) or "None",
+                            "Match Percentage": f"{analysis.skills_match.percentage:.1f}%"
+                        }
+                        st.dataframe(skills_data, use_container_width=True)
+                        
+                        # Education and Experience Fit
+                        st.markdown("**Education Fit**")
+                        st.write(analysis.education_fit)
+                        st.markdown("**Experience Fit**")
+                        st.write(analysis.experience_fit)
+                    
+                    with col2:
+                        # Suitability Score
+                        st.markdown("**Suitability Score**")
+                        st.metric(label="Score (0-100)", value=analysis.suitability_score)
+                    
+                    # Summary
+                    st.markdown("**Summary**")
+                    st.write(analysis.summary)
+                    
+                    # Add to messages for chat history
+                    st.session_state.messages.append({
+                        "role": "system",
+                        "content": f"Analysis completed: Suitability Score {analysis.suitability_score}/100"
+                    })
+        else:
+            st.error("Please upload a resume PDF and enter a job description.")
 
-# Chat-like interface
-st.subheader("Match Analysis Q&A")
-question = st.text_input("Ask a question about the candidate (e.g., 'Is this candidate suitable for the job?' or 'Does the candidate have Python skills?')")
-if st.button("Submit Question"):
-    if question and st.session_state.resume_json and st.session_state.job_json:
-        resume = ResumeData(**st.session_state.resume_json)
-        job = JobData(**st.session_state.job_json)
-        analysis = st.session_state.last_analysis
-        
-        # Get answer from Gemini
-        with st.spinner("Generating answer..."):
-            answer = answer_question(question, resume, job, analysis)
-        
-        st.session_state.messages.append({"role": "user", "content": question})
-        st.session_state.messages.append({"role": "system", "content": answer})
-    else:
-        st.error("Please process the resume and job description first, and enter a question.")
+    # Chat-like interface
+    st.subheader("Match Analysis Q&A")
+    question = st.text_input("Ask a question about the candidate (e.g., 'Is this candidate suitable for the job?' or 'Does the candidate have Python skills?')")
+    if st.button("Submit Question"):
+        if question and st.session_state.resume_json and st.session_state.job_json:
+            resume = ResumeData(**st.session_state.resume_json)
+            job = JobData(**st.session_state.job_json)
+            analysis = st.session_state.last_analysis
+            
+            # Get answer from Groq
+            with st.spinner("Generating answer..."):
+                answer = answer_question(question, resume, job, analysis)
+            
+            st.session_state.messages.append({"role": "user", "content": question})
+            st.session_state.messages.append({"role": "system", "content": answer})
+        else:
+            st.error("Please process the resume and job description first, and enter a question.")
 
-# Display messages
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    # Display messages
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+with tab_bulk:
+    st.subheader("Bulk Resume Extractor")
+    st.markdown("Upload multiple PDFs to extract key fields and download a CSV.")
+
+    bulk_files = st.file_uploader("Upload Resume PDFs", type=["pdf"], accept_multiple_files=True)
+    if st.button("Extract to CSV"):
+        if not bulk_files:
+            st.error("Please upload at least one PDF.")
+        else:
+            rows = []
+            errors = []
+            progress = st.progress(0)
+            total = len(bulk_files)
+
+            for idx, file in enumerate(bulk_files, start=1):
+                data, err = process_resume_bulk(file)
+                if data:
+                    rows.append(data)
+                else:
+                    errors.append(f"{file.name}: {err}")
+                progress.progress(idx / total)
+
+            if errors:
+                st.warning("Some files could not be processed:")
+                for message in errors:
+                    st.write(f"- {message}")
+
+            if rows:
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True)
+
+                csv_data = df.to_csv(index=False)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv_data,
+                    file_name="resume_extracts.csv",
+                    mime="text/csv",
+                )
