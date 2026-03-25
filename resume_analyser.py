@@ -6,6 +6,7 @@ import json
 import os
 from pypdf import PdfReader
 import pandas as pd
+import time
 
 # Define Pydantic models
 class ResumeData(BaseModel):
@@ -58,6 +59,8 @@ if not api_key:
 client = Groq(api_key=api_key)  # Use Streamlit secrets or environment variable
 
 MODEL_NAME = "llama-3.1-8b-instant"
+RETRY_MAX = 3
+RETRY_BACKOFF_SECONDS = 2
 
 # # Sidebar for API key input (optional, for local testing)
 # with st.sidebar:
@@ -79,6 +82,23 @@ if "last_analysis" not in st.session_state:
     st.session_state.last_analysis = None
 
 # Function to process resume PDF
+def _groq_chat_completion(messages, response_format=None, temperature=0.2):
+    for attempt in range(RETRY_MAX):
+        try:
+            kwargs = {"model": MODEL_NAME, "messages": messages, "temperature": temperature}
+            if response_format:
+                kwargs["response_format"] = response_format
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            message = str(e).lower()
+            if "rate_limit" in message or "429" in message:
+                if attempt < RETRY_MAX - 1:
+                    sleep_seconds = RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                    st.info(f"Rate limit hit. Retrying in {sleep_seconds}s...")
+                    time.sleep(sleep_seconds)
+                    continue
+            raise
+
 def process_resume(file):
     try:
         # Extract text locally from PDF for Groq
@@ -101,8 +121,7 @@ def process_resume(file):
             f"Resume Text:\n{resume_text}"
         )
 
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        response = _groq_chat_completion(
             messages=[
                 {"role": "system", "content": "You extract structured data and output strict JSON."},
                 {"role": "user", "content": prompt},
@@ -162,8 +181,7 @@ def process_resume_bulk(file):
             f"Resume Text:\n{resume_text}"
         )
 
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        response = _groq_chat_completion(
             messages=[
                 {"role": "system", "content": "You extract structured data and output strict JSON."},
                 {"role": "user", "content": prompt},
@@ -197,8 +215,7 @@ def process_job_description(text):
             f"Use empty strings for missing fields.\n\n"
             f"Job Description: {text}"
         )
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        response = _groq_chat_completion(
             messages=[
                 {"role": "system", "content": "You extract structured data and output strict JSON."},
                 {"role": "user", "content": prompt},
@@ -245,8 +262,7 @@ def analyze_match(resume, job):
         )
 
         # Make API call for analysis
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        response = _groq_chat_completion(
             messages=[
                 {"role": "system", "content": "You analyze and output strict JSON."},
                 {"role": "user", "content": prompt},
@@ -286,8 +302,7 @@ def answer_question(question, resume, job, analysis):
         )
 
         # Make API call for the answer
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        response = _groq_chat_completion(
             messages=[
                 {"role": "system", "content": "You answer clearly and directly."},
                 {"role": "user", "content": prompt},
