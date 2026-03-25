@@ -1,24 +1,25 @@
 import streamlit as st
-from google import genai
-from pydantic import BaseModel
-from typing import List
-import os
+from groq import Groq
+from pydantic import BaseModel, ValidationError
+from typing import List, Optional, Union
 import json
+import os
+from pypdf import PdfReader
 
 # Define Pydantic models
 class ResumeData(BaseModel):
     name: str
     email: str
-    phone: str
+    phone: Optional[str]
     skills: List[str]
-    education: str
-    experience: str
+    education: Union[str, List[dict]]
+    experience: Union[str, List[dict]]
 
 class JobData(BaseModel):
     title: str
     requiredSkills: List[str]
-    requiredEducation: str
-    requiredExperience: str
+    requiredEducation: Optional[str]
+    requiredExperience: Optional[str]
 
 # Define nested model for skills_match
 class SkillsMatch(BaseModel):
@@ -38,8 +39,14 @@ class AnalysisData(BaseModel):
 st.title("Resume-Job Match Analyzer")
 st.markdown("Upload a resume PDF and enter a job description to get a brutally honest analysis of the candidate’s fit.")
 
-# Set up Gemini client
-client = genai.Client(api_key=st.secrets.get("GEMINI_API_KEY", None))  # Use Streamlit secrets or replace with your key
+# Set up Groq client
+api_key = st.secrets.get("GROQ_API_KEY", None) or os.getenv("GROQ_API_KEY")
+if not api_key:
+    st.error("Missing GROQ_API_KEY. Add it to .streamlit/secrets.toml or export it as an environment variable.")
+    st.stop()
+client = Groq(api_key=api_key)  # Use Streamlit secrets or environment variable
+
+MODEL_NAME = "llama-3.1-8b-instant"
 
 # # Sidebar for API key input (optional, for local testing)
 # with st.sidebar:
@@ -66,66 +73,75 @@ if "last_analysis" not in st.session_state:
 # Function to process resume PDF
 def process_resume(file):
     try:
-        # Save uploaded file temporarily
-        with open("temp_resume.pdf", "wb") as f:
-            f.write(file.read())
-        
-        # Upload to Gemini File API
-        uploaded_file = client.files.upload(
-            file="temp_resume.pdf",
-            config={'display_name': 'Resume PDF'}
-        )
-        file_uri = uploaded_file.uri
+        # Extract text locally from PDF for Groq
+        reader = PdfReader(file)
+        pages_text = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            pages_text.append(page_text)
+        resume_text = "\n".join(pages_text).strip()
 
-        # Define prompt
+        if not resume_text:
+            st.error("Could not extract text from the PDF. Try a different file or a text-based PDF.")
+            return None, None
+
         prompt = (
-            "Extract the details from the provided resume PDF. "
-            "Include the following fields: Name, Email, Phone, Skills (as a list), Education, and Experience. "
-            "Return the data in a structured JSON format."
+            "Extract the details from the resume text. "
+            "Include the following fields: name, email, phone, skills (as a list), education, and experience. "
+            "Return only valid JSON with those fields. Use empty strings for missing fields. "
+            "If education or experience are lists, return them as arrays of objects.\n\n"
+            f"Resume Text:\n{resume_text}"
         )
 
-        # Make API call
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[
-                {'file_data': {'file_uri': file_uri, 'mime_type': 'application/pdf'}},
-                {'text': prompt}
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You extract structured data and output strict JSON."},
+                {"role": "user", "content": prompt},
             ],
-            config={
-                'response_mime_type': 'application/json',
-                'response_schema': ResumeData,
-            },
+            response_format={"type": "json_object"},
+            temperature=0.2,
         )
 
-        # Parse response
-        resume_data = response.parsed
-        return resume_data, response.text
+        raw_json = response.choices[0].message.content
+        resume_data = ResumeData.model_validate_json(raw_json)
 
-    finally:
-        # Clean up
-        if 'uploaded_file' in locals():
-            client.files.delete(name=uploaded_file.name)
-        if os.path.exists("temp_resume.pdf"):
-            os.remove("temp_resume.pdf")
+        # Normalize fields to strings for downstream prompts/UI
+        if isinstance(resume_data.education, list):
+            resume_data.education = json.dumps(resume_data.education, ensure_ascii=True)
+        if isinstance(resume_data.experience, list):
+            resume_data.experience = json.dumps(resume_data.experience, ensure_ascii=True)
+        resume_data.phone = resume_data.phone or ""
+
+        return resume_data, raw_json
+
+    except (ValidationError, json.JSONDecodeError) as e:
+        st.error(f"Failed to parse resume JSON: {e}")
+        return None, None
 
 # Function to process job description
 def process_job_description(text):
     try:
         # Use Gemini to structure job description
         prompt = (
-            f"Convert the following job description into structured JSON with fields: title, requiredSkills (as a list), requiredEducation, and requiredExperience.\n\n"
+            f"Convert the following job description into structured JSON with fields: title, requiredSkills (as a list), requiredEducation, and requiredExperience. "
+            f"Use empty strings for missing fields.\n\n"
             f"Job Description: {text}"
         )
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[{'text': prompt}],
-            config={
-                'response_mime_type': 'application/json',
-                'response_schema': JobData,
-            },
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You extract structured data and output strict JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
         )
-        job_data = response.parsed
-        return job_data, response.text
+        raw_json = response.choices[0].message.content
+        job_data = JobData.model_validate_json(raw_json)
+        job_data.requiredEducation = job_data.requiredEducation or ""
+        job_data.requiredExperience = job_data.requiredExperience or ""
+        return job_data, raw_json
     except Exception as e:
         st.error(f"Error processing job description: {e}")
         return None, None
@@ -137,38 +153,41 @@ def analyze_match(resume, job):
     
     try:
         # Convert resume and job data to strings for the prompt
-        resume_str = json.dumps(resume.dict(), indent=2)
-        job_str = json.dumps(job.dict(), indent=2)
+        resume_str = json.dumps(resume.model_dump(), indent=2)
+        job_str = json.dumps(job.model_dump(), indent=2)
         
-        # Define a detailed prompt for holistic analysis with brutal honesty
+        # Define a balanced prompt for holistic analysis
         prompt = (
-            "You are an uncompromising HR analyst who tells it like it is. Evaluate the candidate’s resume against the job description with brutal honesty, no sugarcoating. "
+            "You are a fair and evidence-based hiring reviewer. Evaluate the candidate’s resume against the job description. "
+            "Be direct and realistic, but not needlessly harsh. Always note strengths as well as gaps. "
             "Consider:\n"
             "- Skills: Which ones match, which are missing, and how critical the gaps are.\n"
-            "- Education: Does it meet the job’s needs, or is it irrelevant or underwhelming?\n"
-            "- Experience: Is it sufficient in depth, relevance, and years, or does it fall short?\n"
-            "- Overall fit: Can this candidate actually do the job, or are they out of their depth?\n\n"
+            "- Education: Does it meet the job’s needs or is there a mismatch?\n"
+            "- Experience: Is it sufficient in depth, relevance, and years?\n"
+            "- Overall fit: Can this candidate do the role with reasonable onboarding?\n\n"
             f"Resume Data:\n{resume_str}\n\n"
             f"Job Description Data:\n{job_str}\n\n"
             "Provide a structured JSON response with:\n"
             "- skills_match: Object with 'matched' (list of matched skills), 'missing' (list of missing skills), 'percentage' (number, e.g., 66.7).\n"
-            "- education_fit: String, brutally honest (e.g., 'Completely inadequate').\n"
-            "- experience_fit: String, brutally honest (e.g., 'Nowhere near enough').\n"
-            "- suitability_score: Integer (0-100), reflecting your unfiltered judgment.\n"
-            "- summary: String, blunt assessment of the candidate’s fit."
+            "- education_fit: String, balanced assessment.\n"
+            "- experience_fit: String, balanced assessment.\n"
+            "- suitability_score: Integer (0-100), calibrated to the role level. Avoid defaulting low scores.\n"
+            "- summary: String, include at least one strength and one gap."
         )
 
         # Make API call for analysis
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[{'text': prompt}],
-            config={
-                'response_mime_type': 'application/json',
-                'response_schema': AnalysisData,
-            },
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You analyze and output strict JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
         )
 
-        return response.parsed
+        raw_json = response.choices[0].message.content
+        return AnalysisData.model_validate_json(raw_json)
 
     except Exception as e:
         st.error(f"Error analyzing match: {e}")
@@ -181,14 +200,15 @@ def answer_question(question, resume, job, analysis):
     
     try:
         # Convert resume, job data, and analysis to strings for the prompt
-        resume_str = json.dumps(resume.dict(), indent=2)
-        job_str = json.dumps(job.dict(), indent=2)
-        analysis_str = json.dumps(analysis.dict(), indent=2) if analysis else "No analysis available."
+        resume_str = json.dumps(resume.model_dump(), indent=2)
+        job_str = json.dumps(job.model_dump(), indent=2)
+        analysis_str = json.dumps(analysis.model_dump(), indent=2) if analysis else "No analysis available."
         
-        # Define a prompt for answering the question with brutal honesty
+        # Define a prompt for answering the question with balanced tone
         prompt = (
-            "You are an uncompromising HR analyst who doesn’t hold back. Answer the question about the candidate’s suitability for the job based on their resume, job description, and previous analysis. "
-            "Be brutally honest, direct, and clear—don’t soften the truth. If the question is broad (e.g., overall suitability), give a no-nonsense judgment. If specific (e.g., a skill), call out strengths or weaknesses bluntly.\n\n"
+            "You are a fair, evidence-based hiring reviewer. Answer the question about the candidate’s suitability for the job based on their resume, job description, and previous analysis. "
+            "Be direct and clear, but balanced. If the question is broad, give a calibrated judgment with a key strength and a key gap. "
+            "If specific, cite evidence and avoid extremes unless the data clearly supports it.\n\n"
             f"Resume Data:\n{resume_str}\n\n"
             f"Job Description Data:\n{job_str}\n\n"
             f"Previous Analysis:\n{analysis_str}\n\n"
@@ -197,13 +217,16 @@ def answer_question(question, resume, job, analysis):
         )
 
         # Make API call for the answer
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[{'text': prompt}],
-            config={'response_mime_type': 'text/plain'},
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You answer clearly and directly."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
         )
 
-        return response.text
+        return response.choices[0].message.content
 
     except Exception as e:
         st.error(f"Error answering question: {e}")
@@ -215,12 +238,12 @@ if st.button("Analyze Match"):
         with st.spinner("Processing resume..."):
             resume_data, resume_raw = process_resume(resume_file)
             if resume_data:
-                st.session_state.resume_json = resume_data.dict()
+                st.session_state.resume_json = resume_data.model_dump()
         
         with st.spinner("Processing job description..."):
             job_data, job_raw = process_job_description(job_description)
             if job_data:
-                st.session_state.job_json = job_data.dict()
+                st.session_state.job_json = job_data.model_dump()
         
         if st.session_state.resume_json and st.session_state.job_json:
             # JSONs are processed but not displayed
